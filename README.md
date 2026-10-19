@@ -9,6 +9,33 @@ This prototype uses **unmodified, pinned llama.cpp**, not the Ollama server.
 It can read ordinary GGUF files or existing Ollama GGUF blobs directly.
 No conversion to Hugging Face weights or full-precision output matrix is needed.
 
+## Python dashboard
+
+```bash
+python3 -m venv .venv
+.venv/bin/python -m pip install -r requirements-ui.txt
+.venv/bin/python -m streamlit run dashboard.py
+```
+
+Open **http://127.0.0.1:8501**. The dashboard provides:
+
+- Local model discovery, including Ollama blobs and split GGUFs; unsupported
+  architectures and missing shards are reported rather than silently measured.
+- Model selection, editable GPU-layer budgets, all available CPU threads by
+  default, token budgets, custom questions, and a 12-question categorized suite.
+- Persistent background batches, live logs, stop/resume, and cached completed
+  tasks. Each model loads once for all selected prompts; models run sequentially.
+- Token-weighted per-model depth curves, log-scale perplexity, native-relative
+  excess NLL and PPL ratios, agreement plots, token/layer heatmaps, answer and
+  teacher-forced prediction inspection, CSV/JSON and interactive HTML exports.
+
+Collection survives browser refreshes and server shutdowns. Use **Batch monitor**
+to stop the worker; closing the browser does not stop it. Click **Refresh results**
+to update analysis during collection. The server binds to localhost and disables
+usage telemetry. This is a trusted local tool, not a multi-user service.
+
+Detailed controls and the larger-model pilot: [docs/experiment-lab.md](docs/experiment-lab.md).
+
 ## Build
 
 Requires Git, CMake >= 3.19, and a C++17 compiler. The first configure downloads
@@ -16,14 +43,16 @@ llama.cpp at the revision recorded in `CMakeLists.txt`.
 
 ```bash
 cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
-cmake --build build -j 8
+cmake --build build -j
 ctest --test-dir build --output-on-failure
 ```
 
 To reuse a checkout at that revision, add
 `-DFETCHCONTENT_SOURCE_DIR_LLAMA=/path/to/llama.cpp` to configure.
-CPU is the default. Optionally configure with `-DGGML_CUDA=ON` and run with
-`--gpu-layers 99`; projection of captured states still runs on CPU.
+CPU is the default. For CUDA use a separate `build-cuda` directory with
+`-DGGML_CUDA=ON`, then run with `--gpu-layers 99` (or a smaller number if the
+weights do not fit). The native final norm/head and reconstructed head run on
+CPU to match quantized arithmetic; transformer blocks can run on GPU.
 
 ## Ask a question
 
@@ -92,11 +121,12 @@ print(hidden.shape)
 
 ## Support and correctness limits
 
-- Initial architecture allowlist: GGUF `llama` (including Mistral models using
-  that architecture), `qwen2`, and dense `qwen3`, with ordinary weighted RMSNorm
-  and an unscaled, bias-free linear head. Other architectures fail explicitly.
-  This is not yet an arbitrary-GGUF adapter: Gemma, GPT-OSS, hybrid/recurrent
-  models, and other normalization/head conventions need separate validation.
+- Architecture adapters: GGUF `llama` (including Mistral/Mixtral), `qwen2`,
+  `qwen3`, `qwen2moe`, `qwen3moe`, `qwen35`, `qwen35moe`, `glm4moe`, `glm-dsa`,
+  and `glm5-next`. GLM-5.3-Flash's four streams are averaged before final RMSNorm,
+  matching its native head. Every run must pass the final-layer check; an adapter
+  entry alone does not mean every model in that family has been tested.
+  Gemma, GPT-OSS, and other head conventions still need separate adapters.
 - A final-layer sanity check compares reconstructed versus native target-token
   NLL at every position. A difference above 0.1 nat aborts; the maximum observed
   difference is recorded. Quantized CPU/GPU matmul paths can differ numerically;
@@ -104,6 +134,10 @@ print(hidden.shape)
 - Hidden activations are copied to CPU. A CPU copy of the quantized head and
   `[layers, vocabulary]` float logits are allocated. Large heads/vocabularies can
   consume significant RAM, and projecting every layer is expensive.
+- For multi-stream models, hidden-state shape is
+  `[scored_tokens, layers, residual_streams, hidden_width]`. Ordinary single-stream
+  models retain the original three-dimensional layout. Raw streams, not their
+  mean, are saved.
 - Self-generated greedy-answer perplexity is biased toward the full model and
   is **not held-out language-model perplexity**. Use it only as a smoke test.
   A future experiment should score a fixed external corpus and measure independent

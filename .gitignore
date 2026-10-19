@@ -1,5 +1,7 @@
 # Byte-compiled / optimized / DLL files
 .deps/
+build-*/
+config/models.local.json
 results/
 *.gguf
 __pycache__/
