@@ -11,6 +11,7 @@ from lenslab.analysis import aggregate, curve, exit_summary, heatmap, load_runs,
 from lenslab.experiments import (LAB, BatchBusy, active_batch, batch_records, cpu_threads,
                                  gpu_layers, launch_batch, process_alive, prompts, start_worker)
 from lenslab.inventory import CATALOG, atomic_json, discover, load_catalog
+from lenslab.trends import nll_result_style, nll_transition_tables, trend_figure, trend_summary
 
 st.set_page_config(page_title="GGUF Lens Lab", page_icon="🔬", layout="wide")
 st.markdown("""<style>
@@ -121,7 +122,9 @@ def active_experiment_panel():
         if (directory / "STOP").exists():
             st.warning("Stop requested. Waiting for the runner to exit; completed results are kept.")
         open_col, stop_col = st.columns(2)
-        open_col.button("Open active experiment", on_click=focus_batch, args=(directory,), key="open_active")
+        if open_col.button("Open active experiment", key="open_active"):
+            focus_batch(directory)
+            st.rerun(scope="app")
         stop_col.button("Stop active experiment", on_click=stop_clicked, args=(directory,), key="stop_active")
 
 
@@ -247,6 +250,42 @@ with compare:
             st.download_button("Download comparison as interactive HTML", fig.to_html(include_plotlyjs=True),
                                "depth-comparison.html", "text/html")
             st.download_button("Download aggregate CSV", agg.to_csv(index=False), "depth-statistics.csv", "text/csv")
+            st.subheader("Does NLL improve at the next layer?")
+            st.caption("ΔNLL = NLL(i+1) − NLL(i) on each token-weighted model/configuration curve. "
+                       "Negative = improved; positive = worsened. Percentages include all transitions; "
+                       "The test compares improved (ΔNLL < 0) against not improved (ΔNLL ≥ 0), including exact zeros. "
+                       "Batch, category, and model filters apply; chart viewing limits do not.")
+            exclude_final_changes = st.checkbox("Exclude final layer from NLL transition statistics", value=False)
+            change_summary, change_details = nll_transition_tables(agg, exclude_final_changes)
+            display_changes = change_summary.drop(columns=["series", "coin_flip_p_one_sided", "coin_flip_p_not_improved", "non_tied"])
+            styled_changes = display_changes.style.apply(
+                lambda row: [nll_result_style(row["signed_p_display"])] * len(row), axis=1)
+            st.dataframe(styled_changes, hide_index=True, width="stretch",
+                         column_config={
+                             "improved_pct": st.column_config.NumberColumn("Improved / down (%)", format="%.2f"),
+                             "not_improved_pct": st.column_config.NumberColumn("Not improved / up or zero (%)", format="%.2f"),
+                             "worsened_pct": st.column_config.NumberColumn("Worsened / up (%)", format="%.2f"),
+                             "tied_pct": st.column_config.NumberColumn("Tied (%)", format="%.2f"),
+                             "coin_flip_p_two_sided": st.column_config.NumberColumn("Coin-flip p (two-sided)", format="%.6g"),
+                             "signed_p_display": st.column_config.NumberColumn("Signed p (+ improved / − not improved)", format="%+.6g"),
+                             "mean_delta_nll": st.column_config.NumberColumn("Mean ΔNLL", format="%.6g")})
+            st.caption("H₀: each transition independently improves with probability 0.5. "
+                       "H₁: improvement probability ≠ 0.5. Exact two-sided p = min(1, 2 × smaller directional tail). "
+                       "No transitions → p is undefined. P-values are unadjusted across model comparisons.")
+            st.caption("Signed p is a display convention: + means more improved, − means more not-improved transitions; "
+                       "its absolute value is the ordinary two-sided p-value (probabilities themselves are never negative). "
+                       "Balanced counts have no direction. Bright red marks any negative signed p (more not improved); "
+                       "green marks non-negative signed p < 0.05 (rejecting the null in favor of improvement). "
+                       "Yellow marks inconclusive results or no transitions; "
+                       "more data may help but does not guarantee significance. Red takes priority for any not-improved majority. "
+                       "The test measures directional bias, "
+                       "not serial dependence of signs.")
+            st.download_button("Download NLL transition summary CSV", change_summary.to_csv(index=False),
+                               "nll-transition-summary.csv", "text/csv")
+            st.download_button("Download every NLL transition CSV", change_details.to_csv(index=False),
+                               "nll-transitions.csv", "text/csv")
+            with st.expander("Individual adjacent-layer NLL changes"):
+                st.dataframe(change_details.drop(columns="series", errors="ignore"), hide_index=True, width="stretch")
             st.subheader("Exact values by model and depth")
             st.caption("Select a model/configuration to read every layer. CSV exports retain full numeric precision.")
             series_options = list(agg["series"].unique())
@@ -263,6 +302,26 @@ with compare:
                 for name in ["depth_pct", "perplexity", "native_perplexity", "ppl_ratio", "excess_nll", "agreement"]})
             st.download_button("Download this model's values as CSV", values.to_csv(index=False),
                                "model-depth-values.csv", "text/csv")
+            with st.expander("Depth trend fits: linear, monotonic, or a step?"):
+                st.caption("Fits use every selected layer, independent of chart viewing limits. "
+                           "NLL is log(perplexity); raw perplexity can be dominated by early-layer extremes. "
+                           "Spearman measures rank trend (−1 for decreasing, +1 for increasing). "
+                           "Isotonic regression allows curves, plateaus, and steps, but no wrong-way motion.")
+                trend_metric = st.selectbox("Fit metric", ["nll", "perplexity", "agreement"])
+                omit_final = st.checkbox("Exclude final layer from fit", value=False)
+                trend_data = agg[agg["series"] == value_series]
+                if len(trend_data) - int(omit_final) >= 3:
+                    st.plotly_chart(trend_figure(trend_data, trend_metric, omit_final), width="stretch")
+                else:
+                    st.info("At least three layers are needed for a fit.")
+                trends = trend_summary(agg)
+                st.dataframe(trends.drop(columns="series", errors="ignore"), hide_index=True, width="stretch")
+                st.download_button("Download trend fits CSV", trends.to_csv(index=False),
+                                   "depth-trends.csv", "text/csv")
+                st.warning("All R² values are in-sample descriptions, not evidence of causality. "
+                           "Isotonic has more flexibility, and the step location is selected on these same data. "
+                           "The full-model greedy target makes final-layer agreement essentially guaranteed. "
+                           "A fixed external corpus and prompt-level validation are needed to test generalization.")
             st.subheader("Early-exit summary")
             threshold = st.slider("Sustained top-1 agreement threshold", 0.5, 1.0, 0.8, step=0.05)
             st.caption("Earliest depth meeting the threshold at every remaining depth. This is a descriptive statistic "
@@ -332,6 +391,14 @@ def batch_monitor():
         return
     by_name = {r["directory"].name: r for r in records}
     running = active_batch()
+    if running and st.session_state.get("monitor_batch") != running.name:
+        active_status = json.loads((running / "status.json").read_text())
+        st.info(f"The running experiment is {running.name} · "
+                f"{active_status.get('current_model', 'Starting worker')}. "
+                "The history selection below is a different experiment.")
+        if st.button("Monitor the running experiment", key="monitor_running"):
+            focus_batch(running)
+            st.rerun(scope="app")
     if st.session_state.get("monitor_batch") not in by_name:
         st.session_state["monitor_batch"] = running.name if running else next(iter(by_name))
     selected = st.selectbox("Experiment history", list(by_name), key="monitor_batch",
@@ -359,7 +426,8 @@ def batch_monitor():
     if status["state"] == "starting":
         st.info("Starting the worker. The experiment slot is already reserved; duplicate starts are blocked.")
     if status["state"] == "blocked":
-        st.info("This saved plan never started because another experiment was running. It has not been lost. "
+        st.info("This is an older saved plan, not the currently running experiment. "
+                "It never started because another experiment was running. It has not been lost. "
                 "You can run it after the active experiment finishes or stops.")
     if (directory / "STOP").exists() and active:
         st.warning("Stopping requested. Waiting for the current model subprocess to exit...")
